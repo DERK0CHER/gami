@@ -25,10 +25,9 @@ struct _OrigamiWindow {
     GtkButton            *undo_button;
 
     /* Header-bar widgets we need to keep in sync with canvas state. */
+    GtkToggleButton      *tool_select_btn;
     GtkToggleButton      *tool_fold_btn;
     GtkToggleButton      *tool_pull_btn;
-    GtkToggleButton      *mode_all_btn;
-    GtkToggleButton      *mode_page_btn;
     GtkToggleButton      *ruler_btn;
     GtkToggleButton      *sidebar_btn;
 
@@ -67,16 +66,27 @@ update_status (OrigamiWindow *self)
 {
     OrigamiCanvasState s = origami_canvas_get_state (self->canvas);
     OrigamiTool t = origami_canvas_get_tool (self->canvas);
-    OrigamiFoldMode m = origami_canvas_get_fold_mode (self->canvas);
+    guint sel = origami_canvas_selection_size (self->canvas);
 
     char buf[256];
     if (t == ORIGAMI_TOOL_PULL) {
         g_snprintf (buf, sizeof buf,
-                    "Pull tool — drag a layer to slide it; Shift-drag rotates it.");
+                    "Pull tool — drag a surface to slide it; Shift-drag rotates.");
+    } else if (t == ORIGAMI_TOOL_SELECT) {
+        if (sel == 0)
+            g_snprintf (buf, sizeof buf,
+                "Select tool — click a surface to select it. "
+                "Ctrl/Shift-click adds. Switch to Fold to draw a line.");
+        else
+            g_snprintf (buf, sizeof buf,
+                "Select tool — %u surface%s selected. "
+                "Ctrl/Shift-click to add or remove. "
+                "Switch to Fold to draw a line.",
+                sel, sel == 1 ? "" : "s");
     } else {
-        const char *target = (m == ORIGAMI_FOLD_MODE_PAGE)
-            ? "the topmost page under your first click"
-            : "every layer that crosses the line";
+        const char *target = (sel > 0)
+            ? "selected surfaces"
+            : "every surface that crosses the line";
         const char *step;
         switch (s) {
         case ORIGAMI_CANVAS_STATE_FIRST_POINT:
@@ -181,8 +191,7 @@ rebuild_layers (OrigamiWindow *self)
         gtk_list_box_remove (box, child);
 
     OrigamiPaper *p = origami_canvas_get_paper (self->canvas);
-    guint sticky = origami_canvas_get_target_layer_id (self->canvas);
-    GtkListBoxRow *to_select = NULL;
+    guint sel_count = origami_canvas_selection_size (self->canvas);
 
     if (p && p->current) {
         for (guint i = 0; i < p->current->layers->len; i++) {
@@ -194,15 +203,8 @@ rebuild_layers (OrigamiWindow *self)
             gtk_widget_set_margin_start  (row_box, 12);
             gtk_widget_set_margin_end    (row_box, 12);
 
-            GtkWidget *swatch = gtk_drawing_area_new ();
-            gtk_widget_set_size_request (swatch, 16, 16);
-            /* Static color via CSS hack — easier to just leave a small
-             * label like "front"/"back" instead. */
-            gtk_widget_set_visible (swatch, FALSE);
-            gtk_box_append (GTK_BOX (row_box), swatch);
-
             char buf[64];
-            g_snprintf (buf, sizeof buf, "Page #%u", l->id);
+            g_snprintf (buf, sizeof buf, "Surface #%u", l->id);
             GtkWidget *name = gtk_label_new (buf);
             gtk_label_set_xalign (GTK_LABEL (name), 0.0);
             gtk_widget_set_hexpand (name, TRUE);
@@ -219,54 +221,59 @@ rebuild_layers (OrigamiWindow *self)
             g_object_set_data (G_OBJECT (row), "layer-id",
                                GUINT_TO_POINTER (l->id));
             gtk_list_box_append (box, row);
-            if (sticky != 0 && l->id == sticky)
-                to_select = GTK_LIST_BOX_ROW (row);
+            if (origami_canvas_is_selected (self->canvas, l->id))
+                gtk_list_box_select_row (box, GTK_LIST_BOX_ROW (row));
         }
     }
 
-    if (to_select)
-        gtk_list_box_select_row (box, to_select);
-    else
-        gtk_list_box_unselect_all (box);
-
     if (self->target_label) {
-        if (sticky != 0) {
-            char tbuf[64];
-            g_snprintf (tbuf, sizeof tbuf, "Target: page #%u", sticky);
-            gtk_label_set_text (self->target_label, tbuf);
-        } else {
-            gtk_label_set_text (self->target_label,
-                                "Target: pick at first click");
-        }
+        char tbuf[80];
+        if (sel_count == 0)
+            g_snprintf (tbuf, sizeof tbuf,
+                        "No selection — folds apply to all surfaces");
+        else
+            g_snprintf (tbuf, sizeof tbuf,
+                        "%u surface%s selected — folds apply to those",
+                        sel_count, sel_count == 1 ? "" : "s");
+        gtk_label_set_text (self->target_label, tbuf);
     }
 
     self->suppress_layer_select = FALSE;
 }
 
 static void
-on_layer_selected (GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
+on_layer_row_selected (GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
+{
+    /* Multi-select mode emits "selected-rows-changed" instead — we use
+     * that path for sync.  This stub stays connected so single-select
+     * fallbacks behave. */
+}
+
+static void
+on_layer_rows_changed (GtkListBox *box, gpointer user_data)
 {
     OrigamiWindow *self = user_data;
     if (self->suppress_layer_select) return;
 
-    if (!row) {
-        origami_canvas_set_target_layer_id (self->canvas, 0);
-    } else {
+    /* Reflect the list box's selection into the canvas selection set. */
+    origami_canvas_clear_selection (self->canvas);
+    GList *rows = gtk_list_box_get_selected_rows (box);
+    for (GList *node = rows; node; node = node->next) {
+        GtkListBoxRow *row = node->data;
         guint id = GPOINTER_TO_UINT (
             g_object_get_data (G_OBJECT (row), "layer-id"));
-        origami_canvas_set_target_layer_id (self->canvas, id);
-        /* Snap mode toggle to "Page". */
-        if (self->mode_page_btn)
-            gtk_toggle_button_set_active (self->mode_page_btn, TRUE);
+        if (id != 0)
+            origami_canvas_add_to_selection (self->canvas, id);
     }
-    rebuild_layers (self); /* refresh target label */
+    g_list_free (rows);
+    rebuild_layers (self);
 }
 
 static void
 on_clear_target (GtkButton *btn, gpointer ud)
 {
     OrigamiWindow *self = ud;
-    origami_canvas_set_target_layer_id (self->canvas, 0);
+    origami_canvas_clear_selection (self->canvas);
     rebuild_layers (self);
 }
 
@@ -298,6 +305,7 @@ static void
 on_canvas_state_changed (OrigamiCanvas *canvas, OrigamiWindow *self)
 {
     update_status (self);
+    rebuild_layers (self);
     origami_canvas3d_redraw (self->canvas3d);
 }
 
@@ -569,6 +577,13 @@ static const GActionEntry win_actions[] = {
 /* ---------- header-bar toggles ---------- */
 
 static void
+on_tool_select_toggled (GtkToggleButton *btn, OrigamiWindow *self)
+{
+    if (gtk_toggle_button_get_active (btn))
+        origami_canvas_set_tool (self->canvas, ORIGAMI_TOOL_SELECT);
+}
+
+static void
 on_tool_fold_toggled (GtkToggleButton *btn, OrigamiWindow *self)
 {
     if (gtk_toggle_button_get_active (btn))
@@ -580,20 +595,6 @@ on_tool_pull_toggled (GtkToggleButton *btn, OrigamiWindow *self)
 {
     if (gtk_toggle_button_get_active (btn))
         origami_canvas_set_tool (self->canvas, ORIGAMI_TOOL_PULL);
-}
-
-static void
-on_mode_all_toggled (GtkToggleButton *btn, OrigamiWindow *self)
-{
-    if (gtk_toggle_button_get_active (btn))
-        origami_canvas_set_fold_mode (self->canvas, ORIGAMI_FOLD_MODE_ALL);
-}
-
-static void
-on_mode_page_toggled (GtkToggleButton *btn, OrigamiWindow *self)
-{
-    if (gtk_toggle_button_get_active (btn))
-        origami_canvas_set_fold_mode (self->canvas, ORIGAMI_FOLD_MODE_PAGE);
 }
 
 static void
@@ -644,13 +645,27 @@ build_header (OrigamiWindow *self)
     adw_header_bar_pack_start (ADW_HEADER_BAR (header), undo_btn);
     self->undo_button = GTK_BUTTON (undo_btn);
 
-    /* Tool group: Fold / Pull. */
+    /* Tool group: Select / Fold / Pull. */
     GtkWidget *tool_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_add_css_class (tool_box, "linked");
+
+    GtkWidget *select_btn = gtk_toggle_button_new ();
+    gtk_button_set_icon_name (GTK_BUTTON (select_btn), "edit-select-all-symbolic");
+    gtk_widget_set_tooltip_text (select_btn,
+        "Select tool — click a surface to select it; "
+        "Ctrl/Shift-click to add or toggle");
+    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (select_btn), TRUE);
+    g_signal_connect (select_btn, "toggled",
+                      G_CALLBACK (on_tool_select_toggled), self);
+    gtk_box_append (GTK_BOX (tool_box), select_btn);
+    self->tool_select_btn = GTK_TOGGLE_BUTTON (select_btn);
+
     GtkWidget *fold_btn = gtk_toggle_button_new ();
     gtk_button_set_icon_name (GTK_BUTTON (fold_btn), "edit-cut-symbolic");
-    gtk_widget_set_tooltip_text (fold_btn, "Fold tool");
-    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (fold_btn), TRUE);
+    gtk_widget_set_tooltip_text (fold_btn,
+        "Fold tool — draw a line, click the side to fold over");
+    gtk_toggle_button_set_group (GTK_TOGGLE_BUTTON (fold_btn),
+                                 GTK_TOGGLE_BUTTON (select_btn));
     g_signal_connect (fold_btn, "toggled",
                       G_CALLBACK (on_tool_fold_toggled), self);
     gtk_box_append (GTK_BOX (tool_box), fold_btn);
@@ -658,34 +673,14 @@ build_header (OrigamiWindow *self)
 
     GtkWidget *pull_btn = gtk_toggle_button_new ();
     gtk_button_set_icon_name (GTK_BUTTON (pull_btn), "object-flip-horizontal-symbolic");
-    gtk_widget_set_tooltip_text (pull_btn, "Pull tool — drag a layer");
+    gtk_widget_set_tooltip_text (pull_btn, "Pull tool — drag a surface");
     gtk_toggle_button_set_group (GTK_TOGGLE_BUTTON (pull_btn),
-                                 GTK_TOGGLE_BUTTON (fold_btn));
+                                 GTK_TOGGLE_BUTTON (select_btn));
     g_signal_connect (pull_btn, "toggled",
                       G_CALLBACK (on_tool_pull_toggled), self);
     gtk_box_append (GTK_BOX (tool_box), pull_btn);
     self->tool_pull_btn = GTK_TOGGLE_BUTTON (pull_btn);
     adw_header_bar_pack_start (ADW_HEADER_BAR (header), tool_box);
-
-    /* Fold mode group. */
-    GtkWidget *mode_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_add_css_class (mode_box, "linked");
-    GtkWidget *all_btn  = gtk_toggle_button_new_with_label ("All");
-    gtk_widget_set_tooltip_text (all_btn, "Fold every layer");
-    g_signal_connect (all_btn, "toggled",
-                      G_CALLBACK (on_mode_all_toggled), self);
-    gtk_box_append (GTK_BOX (mode_box), all_btn);
-    GtkWidget *page_btn = gtk_toggle_button_new_with_label ("Page");
-    gtk_widget_set_tooltip_text (page_btn, "Fold only the page under the cursor");
-    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (page_btn), TRUE);
-    gtk_toggle_button_set_group  (GTK_TOGGLE_BUTTON (page_btn),
-                                  GTK_TOGGLE_BUTTON (all_btn));
-    g_signal_connect (page_btn, "toggled",
-                      G_CALLBACK (on_mode_page_toggled), self);
-    gtk_box_append (GTK_BOX (mode_box), page_btn);
-    self->mode_all_btn  = GTK_TOGGLE_BUTTON (all_btn);
-    self->mode_page_btn = GTK_TOGGLE_BUTTON (page_btn);
-    adw_header_bar_pack_start (ADW_HEADER_BAR (header), mode_box);
 
     GtkWidget *ruler_btn = gtk_toggle_button_new ();
     gtk_button_set_icon_name (GTK_BUTTON (ruler_btn), "view-grid-symbolic");
@@ -968,14 +963,16 @@ build_layers_section (OrigamiWindow *self)
     gtk_widget_set_hexpand (hdr, TRUE);
     gtk_box_append (GTK_BOX (hdr_box), hdr);
 
-    GtkWidget *clear = gtk_button_new_with_label ("Any");
-    gtk_widget_set_tooltip_text (clear, "Clear sticky target — pick at click");
+    GtkWidget *clear = gtk_button_new_with_label ("Clear");
+    gtk_widget_set_tooltip_text (clear,
+        "Clear selection — folds will then apply to every surface");
     gtk_widget_add_css_class (clear, "flat");
     g_signal_connect (clear, "clicked", G_CALLBACK (on_clear_target), self);
     gtk_box_append (GTK_BOX (hdr_box), clear);
     gtk_box_append (GTK_BOX (box), hdr_box);
 
-    GtkWidget *target = gtk_label_new ("Target: pick at first click");
+    GtkWidget *target = gtk_label_new (
+        "No selection — folds apply to all surfaces");
     gtk_widget_add_css_class (target, "dim-label");
     gtk_widget_add_css_class (target, "caption");
     gtk_label_set_xalign (GTK_LABEL (target), 0.0);
@@ -990,9 +987,11 @@ build_layers_section (OrigamiWindow *self)
     gtk_widget_set_margin_start  (list, 12);
     gtk_widget_set_margin_end    (list, 12);
     gtk_widget_set_margin_bottom (list,  4);
-    gtk_list_box_set_selection_mode (GTK_LIST_BOX (list), GTK_SELECTION_SINGLE);
+    gtk_list_box_set_selection_mode (GTK_LIST_BOX (list), GTK_SELECTION_MULTIPLE);
     g_signal_connect (list, "row-selected",
-                      G_CALLBACK (on_layer_selected), self);
+                      G_CALLBACK (on_layer_row_selected), self);
+    g_signal_connect (list, "selected-rows-changed",
+                      G_CALLBACK (on_layer_rows_changed), self);
     gtk_box_append (GTK_BOX (box), list);
     self->layers_list = GTK_LIST_BOX (list);
 

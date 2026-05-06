@@ -16,13 +16,9 @@ typedef enum {
 } OrigamiCanvasState;
 
 typedef enum {
-    ORIGAMI_FOLD_MODE_ALL  = 0,
-    ORIGAMI_FOLD_MODE_PAGE = 1,
-} OrigamiFoldMode;
-
-typedef enum {
-    ORIGAMI_TOOL_FOLD = 0,
-    ORIGAMI_TOOL_PULL = 1,
+    ORIGAMI_TOOL_SELECT = 0,
+    ORIGAMI_TOOL_FOLD   = 1,
+    ORIGAMI_TOOL_PULL   = 2,
 } OrigamiTool;
 
 GtkWidget          *origami_canvas_new          (void);
@@ -33,10 +29,6 @@ void                origami_canvas_reset        (OrigamiCanvas *self);
 void                origami_canvas_undo         (OrigamiCanvas *self);
 gboolean            origami_canvas_can_undo     (OrigamiCanvas *self);
 void                origami_canvas_cancel       (OrigamiCanvas *self);
-
-OrigamiFoldMode     origami_canvas_get_fold_mode(OrigamiCanvas *self);
-void                origami_canvas_set_fold_mode(OrigamiCanvas *self,
-                                                 OrigamiFoldMode mode);
 
 OrigamiTool         origami_canvas_get_tool     (OrigamiCanvas *self);
 void                origami_canvas_set_tool     (OrigamiCanvas *self,
@@ -53,11 +45,26 @@ void                origami_canvas_redraw       (OrigamiCanvas *self);
  * n == 0 -> the unfolded sheet. */
 void                origami_canvas_replay_to    (OrigamiCanvas *self, guint n);
 
-/* "Sticky" target layer: when non-zero, every fold (mouse or by-coord)
- * uses this layer as the target instead of picking from the click. */
-void                origami_canvas_set_target_layer_id (OrigamiCanvas *self,
-                                                        guint id);
-guint               origami_canvas_get_target_layer_id (OrigamiCanvas *self);
+/* Selection: which surfaces the next fold operates on.  Empty = "all
+ * surfaces that the line crosses".  Non-empty = only those layer ids.
+ * After every fold the selection migrates so that newly-created folded
+ * slices are also selected — the user can keep folding the surface
+ * they just made. */
+gboolean            origami_canvas_is_selected   (OrigamiCanvas *self,
+                                                  guint id);
+gboolean            origami_canvas_has_selection (OrigamiCanvas *self);
+guint               origami_canvas_selection_size(OrigamiCanvas *self);
+GArray             *origami_canvas_get_selection (OrigamiCanvas *self);
+void                origami_canvas_clear_selection(OrigamiCanvas *self);
+void                origami_canvas_select_only   (OrigamiCanvas *self, guint id);
+void                origami_canvas_toggle_selection(OrigamiCanvas *self, guint id);
+void                origami_canvas_add_to_selection(OrigamiCanvas *self, guint id);
+
+/* Zoom anchored on the centre of the widget; multiplies the current
+ * zoom by `factor` (clamped to a sane range).  Pass 0 / negative to
+ * reset to fit. */
+void                origami_canvas_zoom_by      (OrigamiCanvas *self, double factor);
+void                origami_canvas_zoom_reset   (OrigamiCanvas *self);
 
 /* Apply a fold given paper-mm coordinates (origin = top-left of paper).
  * sign is +1 / -1 for which side of the line is folded over. */

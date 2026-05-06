@@ -40,7 +40,6 @@ struct _OrigamiCanvas {
 
     OrigamiPaper      *paper;
     OrigamiCanvasState state;
-    OrigamiFoldMode    fold_mode;
     OrigamiTool        tool;
     gboolean           show_rulers;
 
@@ -49,7 +48,6 @@ struct _OrigamiCanvas {
     OrigamiPoint  p2;
     OrigamiPoint  hover;
     gboolean      has_hover;
-    guint         target_layer_id; /* 0 == "all"; locked at first click */
 
     /* live modifier flags */
     gboolean      shift_held;
@@ -61,8 +59,16 @@ struct _OrigamiCanvas {
     OrigamiPoint  pull_anchor;
     gboolean      pull_rotate; /* shift-drag rotates instead of translates */
 
-    /* sticky target chosen from the layer panel (0 == auto/none) */
-    guint         sticky_target_id;
+    /* selection: which surfaces the next fold acts on.  Empty = all. */
+    GHashTable   *selected_ids;   /* set of GUINT_TO_POINTER(id) */
+
+    /* zoom + pan around the paper.  zoom = 1.0 / pan = (0,0) is fit. */
+    double        zoom;
+    double        pan_x, pan_y;
+
+    /* middle-button pan-drag */
+    gboolean      panning;
+    double        pan_anchor_x, pan_anchor_y;
 
     /* fold animation */
     gboolean      animate;
@@ -242,10 +248,12 @@ fit_transform (OrigamiCanvas *self, int w, int h,
     double avail_h = MAX (1.0, (double) h - rw);
     double sx = avail_w / VIRTUAL_W;
     double sy = avail_h / VIRTUAL_H;
-    double s  = MIN (sx, sy);
+    double s_fit = MIN (sx, sy);
+    double s = s_fit * self->zoom;
     *scale = s;
-    *tx = rw + (avail_w - VIRTUAL_W * s) / 2.0;
-    *ty = rw + (avail_h - VIRTUAL_H * s) / 2.0;
+    /* Centre the fit-sized paper, then offset by user pan. */
+    *tx = rw + (avail_w - VIRTUAL_W * s) / 2.0 + self->pan_x;
+    *ty = rw + (avail_h - VIRTUAL_H * s) / 2.0 + self->pan_y;
 }
 
 static void
@@ -422,16 +430,20 @@ draw_point_marker (cairo_t *cr, OrigamiPoint p)
 static void
 highlight_side (cairo_t *cr, OrigamiPaper *paper,
                 OrigamiPoint a, OrigamiPoint b, int side,
-                guint only_layer_id)
+                GHashTable *only_ids)
 {
     if (!paper || !paper->current) return;
+    gboolean restrict_to = (only_ids != NULL
+                            && g_hash_table_size (only_ids) > 0);
 
     cairo_save (cr);
     cairo_set_source_rgba (cr, 0.208, 0.518, 0.894, 0.28);
 
     for (guint i = 0; i < paper->current->layers->len; i++) {
         OrigamiLayer *l = g_ptr_array_index (paper->current->layers, i);
-        if (only_layer_id != 0 && l->id != only_layer_id) continue;
+        if (restrict_to
+            && !g_hash_table_contains (only_ids, GUINT_TO_POINTER (l->id)))
+            continue;
         GArray *world = origami_layer_world_polygon (l);
         GArray *clipped = origami_clip_half_plane (world, a, b, side);
         if (clipped->len >= 3) {
@@ -545,13 +557,16 @@ draw_readout (cairo_t *cr, OrigamiCanvas *self, int width)
     double edge = MIN (d1, d2);
 
     char buf[200];
-    if (self->target_layer_id != 0)
+    guint sel = g_hash_table_size (self->selected_ids);
+    if (sel > 0)
         g_snprintf (buf, sizeof buf,
-                    "len %.1f mm   angle %.1f°   edge %.1f mm   target page #%u",
-                    len_mm, angle_deg, edge, self->target_layer_id);
+                    "len %.1f mm   angle %.1f°   edge %.1f mm   "
+                    "%u surface%s selected",
+                    len_mm, angle_deg, edge, sel, sel == 1 ? "" : "s");
     else
         g_snprintf (buf, sizeof buf,
-                    "len %.1f mm   angle %.1f°   edge %.1f mm   target all layers",
+                    "len %.1f mm   angle %.1f°   edge %.1f mm   "
+                    "all surfaces",
                     len_mm, angle_deg, edge);
 
     cairo_save (cr);
@@ -592,10 +607,11 @@ draw_func (GtkDrawingArea *area, cairo_t *cr,
     cairo_set_source_rgba (cr, 0, 0, 0, 0.018);
     cairo_fill (cr);
 
-    /* Hover-detect a layer for highlight (per-page mode). */
+    /* Hover-detect the topmost layer under the cursor for hint
+     * highlight in Select mode (and so the user knows what they'll
+     * select). */
     OrigamiLayer *hover_layer = NULL;
-    if (self->fold_mode == ORIGAMI_FOLD_MODE_PAGE
-        && self->state == ORIGAMI_CANVAS_STATE_FIRST_POINT
+    if (self->tool == ORIGAMI_TOOL_SELECT
         && self->has_hover && self->paper) {
         hover_layer = origami_paper_layer_at (self->paper, self->hover);
     }
@@ -611,8 +627,8 @@ draw_func (GtkDrawingArea *area, cairo_t *cr,
                 && g_hash_table_contains (self->anim->new_ids,
                                           GUINT_TO_POINTER (l->id)))
                 continue;
-            gboolean is_target = (self->target_layer_id != 0
-                                  && l->id == self->target_layer_id);
+            gboolean is_target = g_hash_table_contains (
+                self->selected_ids, GUINT_TO_POINTER (l->id));
             gboolean is_hover  = (hover_layer && l == hover_layer);
             draw_layer (cr, l, is_target, is_hover);
         }
@@ -669,7 +685,7 @@ draw_func (GtkDrawingArea *area, cairo_t *cr,
                                                    self->p1, self->p2);
             int side = (s_hover >= 0) ? 1 : -1;
             highlight_side (cr, self->paper, self->p1, self->p2, side,
-                            self->target_layer_id);
+                            self->selected_ids);
         }
         draw_fold_line (cr, self->p1, self->p2, FALSE);
         draw_point_marker (cr, self->p1);
@@ -713,6 +729,14 @@ on_pressed (GtkGestureClick *gesture, int n_press,
         return;
     }
 
+    /* Middle button pans regardless of the active tool. */
+    if (button == GDK_BUTTON_MIDDLE) {
+        self->panning = TRUE;
+        self->pan_anchor_x = x;
+        self->pan_anchor_y = y;
+        return;
+    }
+
     if (self->tool == ORIGAMI_TOOL_PULL) {
         OrigamiLayer *l = self->paper
             ? origami_paper_layer_at (self->paper, p) : NULL;
@@ -725,18 +749,30 @@ on_pressed (GtkGestureClick *gesture, int n_press,
         return;
     }
 
+    if (self->tool == ORIGAMI_TOOL_SELECT) {
+        OrigamiLayer *l = self->paper
+            ? origami_paper_layer_at (self->paper, p) : NULL;
+        if (!l) {
+            /* Click on empty space clears the selection (unless the user
+             * is extending). */
+            if (!self->shift_held && !self->ctrl_held)
+                origami_canvas_clear_selection (self);
+            gtk_widget_queue_draw (GTK_WIDGET (self));
+            emit_state_changed (self);
+            return;
+        }
+        if (self->shift_held || self->ctrl_held)
+            origami_canvas_toggle_selection (self, l->id);
+        else
+            origami_canvas_select_only (self, l->id);
+        return;
+    }
+
+    /* FOLD tool below. */
     switch (self->state) {
     case ORIGAMI_CANVAS_STATE_FIRST_POINT: {
         OrigamiPoint eff = effective_first (self, p);
         self->p1 = eff;
-        if (self->sticky_target_id != 0) {
-            self->target_layer_id = self->sticky_target_id;
-        } else if (self->fold_mode == ORIGAMI_FOLD_MODE_PAGE) {
-            OrigamiLayer *l = origami_paper_layer_at (self->paper, eff);
-            self->target_layer_id = l ? l->id : 0;
-        } else {
-            self->target_layer_id = 0;
-        }
         self->state = ORIGAMI_CANVAS_STATE_SECOND_POINT;
         break;
     }
@@ -755,16 +791,25 @@ on_pressed (GtkGestureClick *gesture, int n_press,
     case ORIGAMI_CANVAS_STATE_PICK_SIDE: {
         double s = origami_side_of_line (p, self->p1, self->p2);
         int sign = (s >= 0) ? 1 : -1;
-        guint target = (self->fold_mode == ORIGAMI_FOLD_MODE_PAGE)
-            ? self->target_layer_id : 0;
         anim_stop (self);
         GHashTable *pre_ids = ids_set_from_state (self->paper->current);
-        origami_paper_fold (self->paper, self->p1, self->p2, sign, target);
+        GArray *new_ids = g_array_new (FALSE, FALSE, sizeof (guint));
+        GHashTable *targets =
+            (g_hash_table_size (self->selected_ids) > 0)
+            ? self->selected_ids : NULL;
+        origami_paper_fold (self->paper, self->p1, self->p2, sign,
+                            targets, new_ids);
+        /* Migrate selection: every freshly-created folded surface is
+         * added so the user can keep folding the surface they just
+         * made.  Kept slices retain their original id, so prior
+         * selection survives. */
+        for (guint i = 0; i < new_ids->len; i++) {
+            guint id = g_array_index (new_ids, guint, i);
+            origami_canvas_add_to_selection (self, id);
+        }
+        g_array_free (new_ids, TRUE);
         kickoff_fold_animation (self, self->p1, self->p2, pre_ids);
         self->state = ORIGAMI_CANVAS_STATE_FIRST_POINT;
-        /* Keep the sticky target so the user can keep folding the same
-         * layer; clear the auto-pick target. */
-        self->target_layer_id = self->sticky_target_id;
         emit_history_changed (self);
         break;
     }
@@ -783,6 +828,44 @@ on_released (GtkGestureClick *gesture, int n_press,
         self->pulling = FALSE;
         emit_history_changed (self);
     }
+    if (self->panning) {
+        self->panning = FALSE;
+    }
+}
+
+static gboolean
+on_scroll (GtkEventControllerScroll *ctrl,
+           double dx, double dy, gpointer user_data)
+{
+    OrigamiCanvas *self = user_data;
+
+    /* Zoom anchored on the cursor: keep the paper-space point under the
+     * cursor invariant across the scale change. */
+    int w = gtk_widget_get_width  (GTK_WIDGET (self));
+    int h = gtk_widget_get_height (GTK_WIDGET (self));
+    double cx = self->has_hover ? self->hover.x : VIRTUAL_W / 2.0;
+    double cy = self->has_hover ? self->hover.y : VIRTUAL_H / 2.0;
+
+    double s_old, tx_old, ty_old;
+    fit_transform (self, w, h, &s_old, &tx_old, &ty_old);
+    double widget_x = tx_old + cx * s_old;
+    double widget_y = ty_old + cy * s_old;
+
+    double factor = (dy > 0) ? (1.0 / 1.15) : 1.15;
+    self->zoom *= factor;
+    if (self->zoom < 0.25) self->zoom = 0.25;
+    if (self->zoom > 12.0) self->zoom = 12.0;
+
+    /* Recompute and shift pan so the cursor's paper point stays put. */
+    double s_new, tx_new, ty_new;
+    fit_transform (self, w, h, &s_new, &tx_new, &ty_new);
+    double widget_x_new = tx_new + cx * s_new;
+    double widget_y_new = ty_new + cy * s_new;
+    self->pan_x += widget_x - widget_x_new;
+    self->pan_y += widget_y - widget_y_new;
+
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    return TRUE;
 }
 
 static void
@@ -794,6 +877,16 @@ on_motion (GtkEventControllerMotion *ctrl,
     GdkEvent *ev = gtk_event_controller_get_current_event (
         GTK_EVENT_CONTROLLER (ctrl));
     if (ev) update_modifier_flags (self, gdk_event_get_modifier_state (ev));
+
+    /* Mid-button pan: translate by widget-pixel delta. */
+    if (self->panning) {
+        self->pan_x += (x - self->pan_anchor_x);
+        self->pan_y += (y - self->pan_anchor_y);
+        self->pan_anchor_x = x;
+        self->pan_anchor_y = y;
+        gtk_widget_queue_draw (GTK_WIDGET (self));
+        return;
+    }
 
     double px, py;
     widget_to_paper (self, x, y, &px, &py);
@@ -891,8 +984,8 @@ origami_canvas_reset (OrigamiCanvas *self)
     anim_stop (self);
     origami_paper_reset (self->paper);
     self->state = ORIGAMI_CANVAS_STATE_FIRST_POINT;
-    self->target_layer_id = 0;
-    self->sticky_target_id = 0;
+    g_hash_table_remove_all (self->selected_ids);
+    origami_canvas_zoom_reset (self);
     gtk_widget_queue_draw (GTK_WIDGET (self));
     emit_state_changed (self);
     emit_history_changed (self);
@@ -904,7 +997,6 @@ origami_canvas_undo (OrigamiCanvas *self)
     g_return_if_fail (ORIGAMI_IS_CANVAS (self));
     if (self->state != ORIGAMI_CANVAS_STATE_FIRST_POINT) {
         self->state = ORIGAMI_CANVAS_STATE_FIRST_POINT;
-        self->target_layer_id = 0;
         gtk_widget_queue_draw (GTK_WIDGET (self));
         emit_state_changed (self);
         return;
@@ -933,26 +1025,7 @@ origami_canvas_cancel (OrigamiCanvas *self)
     if (self->state == ORIGAMI_CANVAS_STATE_FIRST_POINT
         && !self->pulling) return;
     self->state = ORIGAMI_CANVAS_STATE_FIRST_POINT;
-    self->target_layer_id = 0;
     self->pulling = FALSE;
-    gtk_widget_queue_draw (GTK_WIDGET (self));
-    emit_state_changed (self);
-}
-
-OrigamiFoldMode
-origami_canvas_get_fold_mode (OrigamiCanvas *self)
-{
-    g_return_val_if_fail (ORIGAMI_IS_CANVAS (self), ORIGAMI_FOLD_MODE_ALL);
-    return self->fold_mode;
-}
-
-void
-origami_canvas_set_fold_mode (OrigamiCanvas *self, OrigamiFoldMode mode)
-{
-    g_return_if_fail (ORIGAMI_IS_CANVAS (self));
-    if (self->fold_mode == mode) return;
-    self->fold_mode = mode;
-    self->target_layer_id = 0;
     gtk_widget_queue_draw (GTK_WIDGET (self));
     emit_state_changed (self);
 }
@@ -970,12 +1043,19 @@ origami_canvas_set_tool (OrigamiCanvas *self, OrigamiTool tool)
     g_return_if_fail (ORIGAMI_IS_CANVAS (self));
     self->tool = tool;
     self->state = ORIGAMI_CANVAS_STATE_FIRST_POINT;
-    self->target_layer_id = 0;
     self->pulling = FALSE;
-    if (tool == ORIGAMI_TOOL_PULL)
+    switch (tool) {
+    case ORIGAMI_TOOL_SELECT:
+        gtk_widget_set_cursor_from_name (GTK_WIDGET (self), "default");
+        break;
+    case ORIGAMI_TOOL_PULL:
         gtk_widget_set_cursor_from_name (GTK_WIDGET (self), "grab");
-    else
+        break;
+    case ORIGAMI_TOOL_FOLD:
+    default:
         gtk_widget_set_cursor_from_name (GTK_WIDGET (self), "crosshair");
+        break;
+    }
     gtk_widget_queue_draw (GTK_WIDGET (self));
     emit_state_changed (self);
 }
@@ -1019,29 +1099,118 @@ origami_canvas_replay_to (OrigamiCanvas *self, guint n)
     while (p->records->len > n && origami_paper_can_undo (p))
         origami_paper_undo (p);
     self->state = ORIGAMI_CANVAS_STATE_FIRST_POINT;
-    self->target_layer_id = self->sticky_target_id;
     gtk_widget_queue_draw (GTK_WIDGET (self));
     emit_state_changed (self);
     emit_history_changed (self);
 }
 
+/* ---------- selection ---------- */
+
+gboolean
+origami_canvas_is_selected (OrigamiCanvas *self, guint id)
+{
+    g_return_val_if_fail (ORIGAMI_IS_CANVAS (self), FALSE);
+    return g_hash_table_contains (self->selected_ids, GUINT_TO_POINTER (id));
+}
+
+gboolean
+origami_canvas_has_selection (OrigamiCanvas *self)
+{
+    g_return_val_if_fail (ORIGAMI_IS_CANVAS (self), FALSE);
+    return g_hash_table_size (self->selected_ids) > 0;
+}
+
+guint
+origami_canvas_selection_size (OrigamiCanvas *self)
+{
+    g_return_val_if_fail (ORIGAMI_IS_CANVAS (self), 0);
+    return g_hash_table_size (self->selected_ids);
+}
+
+GArray *
+origami_canvas_get_selection (OrigamiCanvas *self)
+{
+    g_return_val_if_fail (ORIGAMI_IS_CANVAS (self), NULL);
+    GArray *out = g_array_new (FALSE, FALSE, sizeof (guint));
+    GHashTableIter it;
+    gpointer k, v;
+    g_hash_table_iter_init (&it, self->selected_ids);
+    while (g_hash_table_iter_next (&it, &k, &v)) {
+        guint id = GPOINTER_TO_UINT (k);
+        g_array_append_val (out, id);
+    }
+    return out;
+}
+
 void
-origami_canvas_set_target_layer_id (OrigamiCanvas *self, guint id)
+origami_canvas_clear_selection (OrigamiCanvas *self)
 {
     g_return_if_fail (ORIGAMI_IS_CANVAS (self));
-    self->sticky_target_id = id;
-    self->target_layer_id  = id;
-    if (id != 0 && self->fold_mode != ORIGAMI_FOLD_MODE_PAGE)
-        origami_canvas_set_fold_mode (self, ORIGAMI_FOLD_MODE_PAGE);
+    if (g_hash_table_size (self->selected_ids) == 0) return;
+    g_hash_table_remove_all (self->selected_ids);
     gtk_widget_queue_draw (GTK_WIDGET (self));
     emit_state_changed (self);
 }
 
-guint
-origami_canvas_get_target_layer_id (OrigamiCanvas *self)
+void
+origami_canvas_select_only (OrigamiCanvas *self, guint id)
 {
-    g_return_val_if_fail (ORIGAMI_IS_CANVAS (self), 0);
-    return self->sticky_target_id;
+    g_return_if_fail (ORIGAMI_IS_CANVAS (self));
+    g_hash_table_remove_all (self->selected_ids);
+    if (id != 0)
+        g_hash_table_add (self->selected_ids, GUINT_TO_POINTER (id));
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    emit_state_changed (self);
+}
+
+void
+origami_canvas_toggle_selection (OrigamiCanvas *self, guint id)
+{
+    g_return_if_fail (ORIGAMI_IS_CANVAS (self));
+    if (id == 0) return;
+    gpointer key = GUINT_TO_POINTER (id);
+    if (g_hash_table_contains (self->selected_ids, key))
+        g_hash_table_remove (self->selected_ids, key);
+    else
+        g_hash_table_add (self->selected_ids, key);
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    emit_state_changed (self);
+}
+
+void
+origami_canvas_add_to_selection (OrigamiCanvas *self, guint id)
+{
+    g_return_if_fail (ORIGAMI_IS_CANVAS (self));
+    if (id == 0) return;
+    g_hash_table_add (self->selected_ids, GUINT_TO_POINTER (id));
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+    emit_state_changed (self);
+}
+
+/* ---------- zoom ---------- */
+
+void
+origami_canvas_zoom_by (OrigamiCanvas *self, double factor)
+{
+    g_return_if_fail (ORIGAMI_IS_CANVAS (self));
+    if (factor <= 0) {
+        origami_canvas_zoom_reset (self);
+        return;
+    }
+    self->zoom *= factor;
+    if (self->zoom < 0.25) self->zoom = 0.25;
+    if (self->zoom > 12.0) self->zoom = 12.0;
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+void
+origami_canvas_zoom_reset (OrigamiCanvas *self)
+{
+    g_return_if_fail (ORIGAMI_IS_CANVAS (self));
+    self->zoom  = 1.0;
+    self->pan_x = 0.0;
+    self->pan_y = 0.0;
+    gtk_widget_queue_draw (GTK_WIDGET (self));
 }
 
 void
@@ -1071,16 +1240,20 @@ origami_canvas_fold_mm (OrigamiCanvas *self,
     if (dx * dx + dy * dy < MIN_LINE_LEN * MIN_LINE_LEN)
         return;
 
-    guint target = (self->fold_mode == ORIGAMI_FOLD_MODE_PAGE)
-        ? self->sticky_target_id : 0;
-
     anim_stop (self);
     GHashTable *pre_ids = ids_set_from_state (self->paper->current);
-    origami_paper_fold (self->paper, a, b, sign, target);
+    GArray *new_ids = g_array_new (FALSE, FALSE, sizeof (guint));
+    GHashTable *targets = (g_hash_table_size (self->selected_ids) > 0)
+                          ? self->selected_ids : NULL;
+    origami_paper_fold (self->paper, a, b, sign, targets, new_ids);
+    for (guint i = 0; i < new_ids->len; i++) {
+        guint id = g_array_index (new_ids, guint, i);
+        g_hash_table_add (self->selected_ids, GUINT_TO_POINTER (id));
+    }
+    g_array_free (new_ids, TRUE);
     kickoff_fold_animation (self, a, b, pre_ids);
 
     self->state = ORIGAMI_CANVAS_STATE_FIRST_POINT;
-    self->target_layer_id = self->sticky_target_id;
     gtk_widget_queue_draw (GTK_WIDGET (self));
     emit_state_changed (self);
     emit_history_changed (self);
@@ -1114,6 +1287,7 @@ origami_canvas_dispose (GObject *object)
 {
     OrigamiCanvas *self = ORIGAMI_CANVAS (object);
     anim_stop (self);
+    g_clear_pointer (&self->selected_ids, g_hash_table_destroy);
     g_clear_pointer (&self->paper, origami_paper_free);
     G_OBJECT_CLASS (origami_canvas_parent_class)->dispose (object);
 }
@@ -1142,13 +1316,16 @@ origami_canvas_class_init (OrigamiCanvasClass *klass)
 static void
 origami_canvas_init (OrigamiCanvas *self)
 {
-    self->paper       = origami_paper_new (PAPER_W, PAPER_H);
-    self->state       = ORIGAMI_CANVAS_STATE_FIRST_POINT;
-    self->fold_mode   = ORIGAMI_FOLD_MODE_PAGE;
-    self->tool        = ORIGAMI_TOOL_FOLD;
-    self->show_rulers = TRUE;
-    self->has_hover   = FALSE;
-    self->animate     = TRUE;
+    self->paper        = origami_paper_new (PAPER_W, PAPER_H);
+    self->state        = ORIGAMI_CANVAS_STATE_FIRST_POINT;
+    self->tool         = ORIGAMI_TOOL_SELECT;
+    self->show_rulers  = TRUE;
+    self->has_hover    = FALSE;
+    self->animate      = TRUE;
+    self->zoom         = 1.0;
+    self->pan_x        = 0.0;
+    self->pan_y        = 0.0;
+    self->selected_ids = g_hash_table_new (g_direct_hash, g_direct_equal);
 
     gtk_drawing_area_set_content_width  (GTK_DRAWING_AREA (self), 600);
     gtk_drawing_area_set_content_height (GTK_DRAWING_AREA (self), 600);
@@ -1166,11 +1343,16 @@ origami_canvas_init (OrigamiCanvas *self)
     g_signal_connect (motion, "leave",  G_CALLBACK (on_leave),  self);
     gtk_widget_add_controller (GTK_WIDGET (self), motion);
 
+    GtkEventController *scroll = gtk_event_controller_scroll_new (
+        GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
+    g_signal_connect (scroll, "scroll", G_CALLBACK (on_scroll), self);
+    gtk_widget_add_controller (GTK_WIDGET (self), scroll);
+
     GtkEventController *keys = gtk_event_controller_key_new ();
     g_signal_connect (keys, "key-pressed",  G_CALLBACK (on_key_pressed),  self);
     g_signal_connect (keys, "key-released", G_CALLBACK (on_key_released), self);
     gtk_widget_add_controller (GTK_WIDGET (self), keys);
     gtk_widget_set_focusable (GTK_WIDGET (self), TRUE);
 
-    gtk_widget_set_cursor_from_name (GTK_WIDGET (self), "crosshair");
+    gtk_widget_set_cursor_from_name (GTK_WIDGET (self), "default");
 }
